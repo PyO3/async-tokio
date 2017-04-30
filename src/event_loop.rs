@@ -22,7 +22,7 @@ use ::{PyFuture, PyTask};
 use server;
 use transport;
 use utils::{self, with_py, ToPyErr};
-use pyunsafe::Handle;
+use pyunsafe::{GIL, Handle};
 
 
 thread_local!(
@@ -43,6 +43,7 @@ pub fn new_event_loop(py: Python) -> PyResult<TokioEventLoop> {
         let evloop = TokioEventLoop::create_instance(
             py, core.id(),
             Handle::new(core.handle()),
+            core.remote(),
             Instant::now(),
             addrinfo::start_workers(3),
             RefCell::new(None),
@@ -85,7 +86,8 @@ enum RunStatus {
 py_class!(pub class TokioEventLoop |py| {
     data id: CoreId;
     data handle: Handle;
-    data instant: Instant;
+    data _remote: Remote;
+    data _instant: Instant;
     data _lookup: addrinfo::LookupWorkerSender;
     data _runner: RefCell<Option<oneshot::Sender<bool>>>;
     data _exception_handler: RefCell<PyObject>;
@@ -112,7 +114,7 @@ py_class!(pub class TokioEventLoop |py| {
             }
         }
 
-        PyFuture::new(py, self.handle(py).clone())
+        PyFuture::new(py, &self)
     }
 
     //
@@ -127,7 +129,7 @@ py_class!(pub class TokioEventLoop |py| {
             }
         }
 
-        PyTask::new(py, coro, Some(self.clone_ref(py)), self.handle(py).clone())
+        PyTask::new(py, coro, &self)
     }
 
     //
@@ -136,7 +138,7 @@ py_class!(pub class TokioEventLoop |py| {
     // This is a float expressed in seconds since event loop creation.
     //
     def time(&self) -> PyResult<f64> {
-        let time = self.instant(py).elapsed();
+        let time = self._instant(py).elapsed();
         Ok(time.as_secs() as f64 + (time.subsec_nanos() as f64 / 1_000_000_000.0))
     }
 
@@ -144,7 +146,7 @@ py_class!(pub class TokioEventLoop |py| {
     // Return the time according to the event loop's clock (milliseconds)
     //
     def millis(&self) -> PyResult<u64> {
-        let time = self.instant(py).elapsed();
+        let time = self._instant(py).elapsed();
         Ok(time.as_secs() * 1000 + (time.subsec_nanos() as u64 / 1_000_000))
     }
 
@@ -176,6 +178,31 @@ py_class!(pub class TokioEventLoop |py| {
 
             handle::call_soon(
                 py, &self.handle(py),
+                callback, PyTuple::new(py, &args.as_slice(py)[1..]))
+        }
+    }
+
+    //
+    // def call_soon_threadsafe(self, callback, *args):
+    //
+    // Like call_soon(), but thread-safe.
+    //
+    def call_soon_threadsafe(&self, *args, **kwargs) -> PyResult<handle::PyHandle> {
+        if self._debug(py).get() {
+            if let Some(err) = thread_safe_check(py, &self.id(py)) {
+                return Err(err)
+            }
+        }
+
+        if args.len(py) < 1 {
+            Err(PyErr::new::<exc::TypeError, _>(
+                py, format!("function takes at least {} arguments", 1)))
+        } else {
+            // get params
+            let callback = args.get_item(py, 0);
+
+            handle::call_soon_threadsafe(
+                py, self._remote(py),
                 callback, PyTuple::new(py, &args.as_slice(py)[1..]))
         }
     }
@@ -243,7 +270,7 @@ py_class!(pub class TokioEventLoop |py| {
 
             // calculate delay
             let when = utils::parse_seconds(py, "when", args.get_item(py, 0))?;
-            let time = when - self.instant(py).elapsed();
+            let time = when - self._instant(py).elapsed();
 
             handle::call_later(
                 py, &self.handle(py), time, callback, PyTuple::new(py, &args.as_slice(py)[2..]))
@@ -309,7 +336,7 @@ py_class!(pub class TokioEventLoop |py| {
                     family: i32=0, socktype: i32 = 0,
                     proto: i32 = 0, flags: i32 = 0) -> PyResult<PyFuture> {
         // result future
-        let res = PyFuture::new(py, self.handle(py).clone())?;
+        let res = PyFuture::new(py, &self)?;
 
         // create processing future
         let fut = res.clone_ref(py);
@@ -400,7 +427,7 @@ py_class!(pub class TokioEventLoop |py| {
         }
 
         server::create_server(
-            py, protocol_factory, self.handle(py).clone(),
+            py, protocol_factory, &self,
             Some(String::from(host.unwrap().to_string_lossy(py))), Some(port.unwrap_or(0)),
             family, flags, sock, backlog, ssl, reuse_address, reuse_port,
             transport::tcp_transport_factory)
@@ -421,7 +448,7 @@ py_class!(pub class TokioEventLoop |py| {
         }
 
         server::create_server(
-            py, protocol_factory, self.handle(py).clone(),
+            py, protocol_factory, &self,
             Some(String::from(host.unwrap().to_string_lossy(py))), Some(port.unwrap_or(0)),
             family, flags, sock, backlog, ssl, reuse_address, reuse_port,
             http::http_transport_factory)
@@ -511,8 +538,9 @@ py_class!(pub class TokioEventLoop |py| {
                     None => host.clone(),
                 };
 
-                let fut = PyFuture::new(py, self.handle(py).clone())?;
+                let fut = PyFuture::new(py, &self)?;
 
+                let evloop = self.clone_ref(py);
                 let handle = self.handle(py).clone();
                 let fut_err = fut.clone_ref(py);
                 let fut_conn = fut.clone_ref(py);
@@ -534,7 +562,7 @@ py_class!(pub class TokioEventLoop |py| {
                             } else {
                                 future::Either::B(
                                     client::create_connection(
-                                        protocol_factory, handle, addrs, ctx, server_hostname))
+                                        protocol_factory, evloop, addrs, ctx, server_hostname))
                             }
                         }
                     })
@@ -600,7 +628,7 @@ py_class!(pub class TokioEventLoop |py| {
         if *handler == py.None() {
             error!("Unhandled error in ecent loop, context: {}", context.into_object());
         } else {
-            let res = handler.call(py, (context.clone_ref(py),).to_py_object(py), None);
+            let res = handler.call(py, (self.clone_ref(py), context.clone_ref(py),), None);
             if let Err(err) = res {
                 // Exception in the user set custom exception handler.
                 error!(
@@ -681,16 +709,22 @@ py_class!(pub class TokioEventLoop |py| {
     //
     def run_until_complete(&self, fut: PyObject) -> PyResult<PyObject> {
         let (completed, result) =
+            // PyTask
             if let Ok(fut) = PyTask::downcast_from(py, fut.clone_ref(py)) {
                 let fut2 = fut.clone_ref(py);
                 (py.allow_threads(|| self.run_future(Box::new(fut2))), fut.result(py))
-
+            // PyFuture
             } else if let Ok(fut) = PyFuture::downcast_from(py, fut.clone_ref(py)) {
                 let fut2 = fut.clone_ref(py);
                 (py.allow_threads(|| self.run_future(Box::new(fut2))), fut.result(py))
+            // support asyncio.Future object
+            } else if fut.hasattr(py, "_asyncio_future_blocking")? {
+                let fut = PyFuture::from_fut(py, &self, fut)?;
+                let fut2 = fut.clone_ref(py);
+                (py.allow_threads(|| self.run_future(Box::new(fut2))), fut.result(py))
             } else {
-                let fut = PyTask::new(
-                    py, fut.clone_ref(py), Some(self.clone_ref(py)), self.handle(py).clone())?;
+                // TODO: add check for Generator object
+                let fut = PyTask::new(py, fut.clone_ref(py), &self)?;
                 let fut2 = fut.clone_ref(py);
                 (py.allow_threads(|| self.run_future(Box::new(fut2))), fut.result(py))
             };
@@ -725,8 +759,16 @@ py_class!(pub class TokioEventLoop |py| {
 
 impl TokioEventLoop {
 
-    pub fn remote(&self, py: Python) -> Remote {
-        self.handle(py).remote().clone()
+    pub fn remote(&self) -> &Remote {
+        self._remote(GIL::python())
+    }
+
+    pub fn href(&self) -> &Handle {
+        self.handle(GIL::python())
+    }
+
+    pub fn get_handle(&self) -> Handle {
+        self.handle(GIL::python()).clone()
     }
 
     pub fn set_current_task(&self, py: Python, task: PyObject) {

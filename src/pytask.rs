@@ -8,13 +8,12 @@ use boxfnonce::SendBoxFnOnce;
 
 use ::TokioEventLoop;
 use utils::{Classes, PyLogger};
-use pyunsafe::{GIL, Handle};
+use pyunsafe::GIL;
 use pyfuture::{_PyFuture, PyFuture, Callback, State};
 
 
 py_class!(pub class PyTask |py| {
-    data _loop: Option<TokioEventLoop>;
-    data _handle: Handle;
+    data _loop: TokioEventLoop;
     data _fut: cell::RefCell<_PyFuture>;
     data _waiter: cell::RefCell<Option<PyObject>>;
     data _must_cancel: cell::Cell<bool>;
@@ -168,11 +167,8 @@ py_class!(pub class PyTask |py| {
 
     // compatibility
     property _loop {
-        get(&slf) -> PyResult<PyObject> {
-            match *slf._loop(py) {
-                Some(ref evloop) => Ok(evloop.clone_ref(py).into_object()),
-                None => Ok(py.None())
-            }
+        get(&slf) -> PyResult<TokioEventLoop> {
+            Ok(slf._loop(py).clone_ref(py))
         }
     }
 
@@ -184,9 +180,6 @@ py_class!(pub class PyTask |py| {
             }
         }
     }
-
-
-
 
     property _must_cancel {
         get(&slf) -> PyResult<bool> {
@@ -220,17 +213,17 @@ py_class!(pub class PyTask |py| {
 
 impl PyTask {
 
-    pub fn new(py: Python, coro: PyObject,
-               evloop: Option<TokioEventLoop>, handle: Handle) -> PyResult<PyTask> {
+    pub fn new(py: Python, coro: PyObject, evloop: &TokioEventLoop) -> PyResult<PyTask> {
         let task = PyTask::create_instance(
-            py, evloop, handle.clone(), cell::RefCell::new(_PyFuture::new(handle.clone())),
+            py, evloop.clone_ref(py),
+            cell::RefCell::new(_PyFuture::new(evloop.get_handle())),
             cell::RefCell::new(None),
             cell::Cell::new(false),
         )?;
 
         let fut = task.clone_ref(py);
 
-        handle.spawn_fn(move|| {
+        evloop.href().spawn_fn(move|| {
             let gil = Python::acquire_gil();
             let py = gil.python();
 
@@ -340,9 +333,7 @@ fn task_step(py: Python, task: PyTask, coro: PyObject, exc: Option<PyObject>, re
     *task._waiter(py).borrow_mut() = None;
 
     // set current task
-    if let Some(ref evloop) = *task._loop(py) {
-        evloop.set_current_task(py, task.clone_ref(py).into_object());
-    }
+    task._loop(py).set_current_task(py, task.clone_ref(py).into_object());
 
     // call either coro.throw(exc) or coro.send(None).
     let res = match exc {
@@ -413,13 +404,33 @@ fn task_step(py: Python, task: PyTask, coro: PyObject, exc: Option<PyObject>, re
                     task._must_cancel(py).set(false)
                 }
             }
+            else if result.hasattr(py, "_asyncio_future_blocking").unwrap() {
+                // wrap into PyFuture, use unwrap because if it failes then whole
+                // processes is hosed
+                let fut = PyFuture::from_fut(py, task._loop(py), result).unwrap();
+
+                // store ref to future
+                *task._waiter(py).borrow_mut() = Some(fut.clone_ref(py).into_object());
+
+                // schedule wakeup on done
+                let waiter_task = task.clone_ref(py);
+                let _ = fut.add_callback(py, SendBoxFnOnce::from(move |result| {
+                    wakeup_task(waiter_task, coro, result);
+                }));
+
+                // cancel if needed
+                if task._must_cancel(py).get() {
+                    let _ = fut.cancel(py);
+                    task._must_cancel(py).set(false)
+                }
+            }
             else if result == py.None() {
                 // call soon
                 let task2 = task.clone_ref(py);
                 if retry < INPLACE_RETRY {
                     task_step(py, task2, coro, None, retry+1);
                 } else {
-                    task._handle(py).spawn_fn(move|| {
+                    task._loop(py).href().spawn_fn(move|| {
                         let gil = Python::acquire_gil();
                         let py = gil.python();
 
@@ -433,7 +444,7 @@ fn task_step(py: Python, task: PyTask, coro: PyObject, exc: Option<PyObject>, re
             else {
                 // Yielding something else is an error.
                 let task2 = task.clone_ref(py);
-                task._handle(py).spawn_fn(move|| {
+                task._loop(py).get_handle().spawn_fn(move|| {
                     let gil = Python::acquire_gil();
                     let py = gil.python();
 
