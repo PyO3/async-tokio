@@ -1,6 +1,7 @@
 #![allow(unused_variables)]
 
 use std::cell;
+use std::fmt;
 use cpython::*;
 use futures::{future, unsync, Poll};
 use futures::unsync::oneshot;
@@ -16,6 +17,17 @@ pub enum State {
     Pending,
     Cancelled,
     Finished,
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let state = match *self {
+            State::Pending => "pending",
+            State::Cancelled => "cancelled",
+            State::Finished => "finished"
+        };
+        write!(f, "{}", state)
+    }
 }
 
 pub type Callback = SendBoxFnOnce<(PyResult<PyObject>,)>;
@@ -296,7 +308,7 @@ impl _PyFuture {
             }
         }
     }
-    
+
     //
     // Mark the future done and set its result.
     //
@@ -675,6 +687,10 @@ py_class!(pub class PyFuture |py| {
 
     def __clear__(&self) {
         let _ = self._fut(py).borrow_mut().callbacks.take();
+    }
+
+    def __repr__(&self) -> PyResult<String> {
+        Ok(format!("<Future {}>", self.state(py)))
     }
 
     // handler for asyncio.Future completion
