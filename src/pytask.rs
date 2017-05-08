@@ -165,6 +165,11 @@ py_class!(pub class PyTask |py| {
         let _ = self._fut(py).borrow_mut().callbacks.take();
     }
 
+    def __repr__(&self) -> PyResult<String> {
+        let future = self._fut(py).borrow();
+        Ok(format!("<Task {}>", future.state()))
+    }
+
     // compatibility
     property _loop {
         get(&slf) -> PyResult<TokioEventLoop> {
